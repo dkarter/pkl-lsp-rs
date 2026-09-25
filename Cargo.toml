@@ -3,8 +3,14 @@ name = "pkl-lsp-rs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Experimental, Java-free Pkl language server"
+description = "Experimental Rust Pkl language server"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10"
+tree-sitter = "0.25.10"
+tree-sitter-pkl = { git = "https://github.com/apple/tree-sitter-pkl", rev = "c95d8284940f5e1da2cd0d8f1ee45d7ef9ef75d1", version = "0.21.0" }
+ureq = { version = "3", features = ["rustls"] }
+url = "2"
+zip = { version = "5", default-features = false, features = ["deflate"] }

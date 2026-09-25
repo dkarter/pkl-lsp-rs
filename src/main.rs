@@ -1,3 +1,4 @@
+mod schema;
 mod server;
 
 fn main() {
