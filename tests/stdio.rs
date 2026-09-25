@@ -79,6 +79,133 @@ fn syntax_diagnostics_are_published_and_cleared_on_change() {
 }
 
 #[test]
+fn typed_literal_mismatch_diagnostic_clears_when_fixed() {
+    let messages = exchange_all(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/typed.pkl","languageId":"pkl","version":1,"text":"name: String = 42"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/typed.pkl","version":2},"contentChanges":[{"text":"name: String = \"ok\""}]}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    let diagnostics: Vec<_> = messages
+        .iter()
+        .filter(|message| message["method"] == "textDocument/publishDiagnostics")
+        .collect();
+    assert_eq!(
+        diagnostics[0]["params"]["diagnostics"][0]["code"],
+        "type-mismatch"
+    );
+    assert_eq!(
+        diagnostics[0]["params"]["diagnostics"][0]["range"]["start"],
+        json!({"line":0,"character":15})
+    );
+    assert_eq!(diagnostics[1]["params"]["diagnostics"], json!([]));
+}
+
+#[test]
+fn amended_property_literal_type_is_checked() {
+    let messages = exchange_all(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/typed-base.pkl","languageId":"pkl","version":1,"text":"module Base\nname: String"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/typed-child.pkl","languageId":"pkl","version":1,"text":"amends \"./typed-base.pkl\"\nname = 42"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    let diagnostics: Vec<_> = messages
+        .iter()
+        .filter(|message| message["method"] == "textDocument/publishDiagnostics")
+        .collect();
+    assert_eq!(
+        diagnostics[1]["params"]["diagnostics"][0]["code"],
+        "type-mismatch"
+    );
+    assert_eq!(
+        diagnostics[1]["params"]["diagnostics"][0]["message"],
+        "Expected String, found Int"
+    );
+}
+
+#[test]
+fn changing_open_base_republishes_amending_child_diagnostics() {
+    let messages = exchange_all(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/recheck-base.pkl","languageId":"pkl","version":1,"text":"module Base\nname: String"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/recheck-child.pkl","languageId":"pkl","version":1,"text":"amends \"./recheck-base.pkl\"\nname = 42"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/recheck-base.pkl","version":2},"contentChanges":[{"text":"module Base\nname: Int"}]}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    let child: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["uri"] == "file:///tmp/recheck-child.pkl"
+        })
+        .collect();
+    assert_eq!(child.len(), 2);
+    assert_eq!(
+        child[0]["params"]["diagnostics"][0]["code"],
+        "type-mismatch"
+    );
+    assert_eq!(child[1]["params"]["diagnostics"], json!([]));
+}
+
+#[test]
+fn unused_import_produces_diagnostic_and_removal_quick_fix() {
+    let messages = exchange_all(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/imports.pkl","languageId":"pkl","version":1,"text":"import \"./schema.pkl\" as Schema\nvalue = 1\n"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///tmp/imports.pkl"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":31}},"context":{"diagnostics":[{"code":"unused-import","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":31}}}]}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    let published = messages
+        .iter()
+        .find(|message| message["method"] == "textDocument/publishDiagnostics")
+        .unwrap();
+    assert_eq!(
+        published["params"]["diagnostics"][0]["code"],
+        "unused-import"
+    );
+    let action = messages.iter().find(|message| message["id"] == 2).unwrap();
+    assert_eq!(action["result"][0]["kind"], "quickfix");
+    assert_eq!(
+        action["result"][0]["edit"]["changes"]["file:///tmp/imports.pkl"][0]["newText"],
+        ""
+    );
+    assert_eq!(
+        action["result"][0]["edit"]["changes"]["file:///tmp/imports.pkl"][0]["range"]["end"],
+        json!({"line":1,"character":0})
+    );
+}
+
+#[test]
+fn formatting_normalizes_property_assignment_without_changing_string_contents() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/format.pkl","languageId":"pkl","version":1,"text":"answer=42\nmessage=\"a=b\""}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///tmp/format.pkl"},"options":{"tabSize":2,"insertSpaces":true}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///tmp/format.pkl","version":2},"contentChanges":[{"text":"answer = 42\nmessage = \"a=b\"\n"}]}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///tmp/format.pkl"},"options":{"tabSize":2,"insertSpaces":true}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(
+        result[0]["result"]["capabilities"]["documentFormattingProvider"],
+        true
+    );
+    let edits = result[1]["result"].as_array().unwrap();
+    assert!(edits.iter().any(|edit| edit["newText"] == " = "));
+    assert!(edits.iter().any(|edit| edit["newText"] == "\n"));
+    assert!(
+        !edits
+            .iter()
+            .any(|edit| edit["newText"].as_str().unwrap().contains("a = b"))
+    );
+    assert_eq!(result[2]["result"], json!([]));
+}
+
+#[test]
 fn hover_and_definition_resolve_local_typed_property() {
     let result = exchange(&[
         initialize(),
@@ -141,6 +268,36 @@ fn semantic_tokens_highlight_documentation_member_links() {
     assert_eq!(result[1]["result"]["data"], json!([0, 8, 5, 0, 1]));
 }
 
+#[test]
+fn semantic_tokens_include_indented_doc_comment_column() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/indented.pkl","languageId":"pkl","version":1,"text":"class C {\n  /// See [bar]\n  foo: String\n  bar: Int\n}"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":"file:///tmp/indented.pkl"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["result"]["data"], json!([1, 10, 5, 0, 1]));
+}
+
+#[test]
+fn code_action_only_removes_requested_unused_import() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/two-imports.pkl","languageId":"pkl","version":1,"text":"import \"./a.pkl\" as A\nimport \"./b.pkl\" as B\nfoo = 1\n"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///tmp/two-imports.pkl"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":21}},"context":{"diagnostics":[{"code":"unused-import","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":21}}}]}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(
+        result[1]["result"][0]["edit"]["changes"]["file:///tmp/two-imports.pkl"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 fn initialize() -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}})
 }
@@ -178,14 +335,33 @@ fn document_lifecycle_and_local_completion() {
 }
 
 #[test]
-fn unsupported_request_is_not_silently_successful() {
+fn invalid_package_request_is_not_silently_successful() {
     let result = exchange(&[
         initialize(),
         json!({"jsonrpc":"2.0","id":9,"method":"pkl/downloadPackage","params":"not-a-package"}),
         json!({"jsonrpc":"2.0","id":10,"method":"shutdown"}),
         json!({"jsonrpc":"2.0","method":"exit"}),
     ]);
-    assert_eq!(result[1]["error"]["code"], -32601);
+    assert_eq!(result[1]["error"]["code"], -32602);
+}
+
+#[test]
+#[ignore = "requires public GitHub release network access"]
+fn package_download_request_makes_public_module_available() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/downloadPackage","params":"package://github.com/jdx/hk/releases/download/v2.0.1/hk@2.0.1"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"pkl/fileContents","params":{"uri":"package://github.com/jdx/hk/releases/download/v2.0.1/hk@2.0.1#/Config.pkl"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["result"], Value::Null);
+    assert!(
+        result[2]["result"]
+            .as_str()
+            .unwrap()
+            .contains("min_hk_version")
+    );
 }
 
 #[test]

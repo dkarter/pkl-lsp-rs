@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 struct Server {
     documents: HashMap<String, String>,
+    document_versions: HashMap<String, i64>,
     package_cache: HashMap<String, (Option<String>, Instant)>,
+    archives: HashMap<String, Vec<u8>>,
     outbound: Vec<Value>,
     shutdown: bool,
 }
@@ -104,6 +106,8 @@ impl Server {
                 "completionProvider": {"resolveProvider": false, "triggerCharacters": [".", "/", "\"", ":"]},
                 "hoverProvider": true,
                 "definitionProvider": true,
+                "codeActionProvider": {"codeActionKinds":["quickfix"]},
+                "documentFormattingProvider": true,
                 "semanticTokensProvider": {"legend":{"tokenTypes":["property"],"tokenModifiers":["documentation"]},"full":true,"range":false}
             }, "serverInfo": {"name": "pkl-lsp-rs", "version": env!("CARGO_PKG_VERSION")}}),
             "shutdown" => {
@@ -116,7 +120,12 @@ impl Server {
                     params["textDocument"]["text"].as_str(),
                 ) {
                     self.documents.insert(uri.to_owned(), text.to_owned());
-                    self.publish_diagnostics(uri, text, params["textDocument"]["version"].as_i64());
+                    let version = params["textDocument"]["version"].as_i64();
+                    if let Some(version) = version {
+                        self.document_versions.insert(uri.to_owned(), version);
+                    }
+                    self.publish_diagnostics(uri, text, version);
+                    self.republish_dependents(uri);
                 }
                 return None;
             }
@@ -130,21 +139,50 @@ impl Server {
                 ) && let Some(document) = self.documents.get_mut(uri)
                 {
                     *document = text.to_owned();
-                    self.publish_diagnostics(uri, text, params["textDocument"]["version"].as_i64());
+                    let version = params["textDocument"]["version"].as_i64();
+                    if let Some(version) = version {
+                        self.document_versions.insert(uri.to_owned(), version);
+                    }
+                    self.publish_diagnostics(uri, text, version);
+                    self.republish_dependents(uri);
                 }
                 return None;
             }
             "textDocument/didClose" => {
                 if let Some(uri) = params["textDocument"]["uri"].as_str() {
                     self.documents.remove(uri);
+                    self.document_versions.remove(uri);
                     self.outbound.push(json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"diagnostics":[]}}));
+                    self.republish_dependents(uri);
                 }
                 return None;
             }
-            "pkl/fileContents" => self
-                .documents
-                .get(params["uri"].as_str().unwrap_or(""))
-                .map_or(Value::Null, |text| json!(text)),
+            "pkl/fileContents" => {
+                let uri = params["uri"].as_str().unwrap_or("");
+                let text = self.documents.get(uri).cloned().or_else(|| {
+                    let (package, member) = uri.split_once("#/")?;
+                    schema::package_member(self.archives.get(package)?, member)
+                });
+                text.map_or(Value::Null, |text| json!(text))
+            }
+            "pkl/downloadPackage" => {
+                let uri = params.as_str().unwrap_or("");
+                if !uri.starts_with("package://") || uri.contains('#') {
+                    return message.get("id").map(|id| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Expected a package URI without a fragment"}}));
+                }
+                if !self.archives.contains_key(uri) {
+                    let Some(archive) = schema::package_archive(uri) else {
+                        return message.get("id").map(|id| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Could not download or verify package"}}));
+                    };
+                    if self.archives.len() >= 16 {
+                        self.archives.clear();
+                    }
+                    self.archives.insert(uri.to_owned(), archive);
+                }
+                self.package_cache
+                    .retain(|member, _| !member.starts_with(&format!("{uri}#/")));
+                Value::Null
+            }
             "textDocument/completion" => {
                 let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
                 let text = self.documents.get(uri).cloned();
@@ -201,6 +239,53 @@ impl Server {
                     .map_or_else(Vec::new, |text| schema::documentation_tokens(text));
                 json!({"data":data})
             }
+            "textDocument/codeAction" => {
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                let requested = params["context"]["diagnostics"].as_array();
+                let edits: Vec<Value> = self
+                    .documents
+                    .get(uri)
+                    .filter(|_| requested.is_some())
+                    .map(|text| {
+                        schema::unused_imports(text)
+                            .into_iter()
+                            .filter(|unused| {
+                                requested.is_some_and(|diagnostics| {
+                                    diagnostics.iter().any(|diagnostic| {
+                                        diagnostic["code"] == "unused-import"
+                                            && diagnostic["range"]["start"]["line"]
+                                                == unused.diagnostic["range"]["start"]["line"]
+                                            && unused.diagnostic["range"]["start"]["line"]
+                                                .as_u64()
+                                                .is_some_and(|line| {
+                                                    params["range"]["start"]["line"]
+                                                        .as_u64()
+                                                        .is_some_and(|start| start <= line)
+                                                        && params["range"]["end"]["line"]
+                                                            .as_u64()
+                                                            .is_some_and(|end| end >= line)
+                                                })
+                                    })
+                                })
+                            })
+                            .map(|unused| unused.edit)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if edits.is_empty() {
+                    json!([])
+                } else {
+                    json!([{"title":"Remove unused imports","kind":"quickfix","edit":{"changes":{uri:edits}}}])
+                }
+            }
+            "textDocument/formatting" => {
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                json!(
+                    self.documents
+                        .get(uri)
+                        .map_or_else(Vec::new, |text| schema::format_edits(text))
+                )
+            }
             "initialized" | "textDocument/didSave" | "$/cancelRequest" => return None,
             _ => {
                 return message.get("id").map(|id| json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32601,"message":format!("Method not implemented: {method}")}}));
@@ -213,8 +298,35 @@ impl Server {
 }
 
 impl Server {
+    fn republish_dependents(&mut self, changed: &str) {
+        let dependents: Vec<_> = self
+            .documents
+            .iter()
+            .filter_map(|(uri, text)| {
+                let amended = schema::amends_uri(text)?;
+                let target = url::Url::parse(uri).ok()?.join(amended).ok()?;
+                (uri != changed && target.as_str() == changed).then(|| {
+                    (
+                        uri.clone(),
+                        text.clone(),
+                        self.document_versions.get(uri).copied(),
+                    )
+                })
+            })
+            .collect();
+        for (uri, text, version) in dependents {
+            self.publish_diagnostics(&uri, &text, version);
+        }
+    }
+
     fn publish_diagnostics(&mut self, uri: &str, text: &str, version: Option<i64>) {
-        let diagnostics = schema::syntax_errors(text);
+        let inherited =
+            if schema::amends_uri(text).is_some_and(|target| !target.starts_with("package://")) {
+                self.inherited_schema(uri, text)
+            } else {
+                None
+            };
+        let diagnostics = schema::diagnostics(text, inherited.as_ref().map(|(_, schema)| schema));
         self.outbound.push(json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"version":version,"diagnostics":diagnostics}}));
     }
 
@@ -227,7 +339,14 @@ impl Server {
             let text = if let Some(cached) = cached {
                 cached?
             } else {
-                let fetched = schema::package_module(amended);
+                let fetched = amended
+                    .split_once("#/")
+                    .and_then(|(package, member)| {
+                        self.archives
+                            .get(package)
+                            .and_then(|bytes| schema::package_member(bytes, member))
+                    })
+                    .or_else(|| schema::package_module(amended));
                 if self.package_cache.len() >= 16 {
                     self.package_cache.clear();
                 }

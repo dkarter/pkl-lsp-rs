@@ -2,9 +2,11 @@
 
 An **experimental**, independent Rust implementation of the Pkl Language Server.
 **Do not use it as a drop-in replacement yet.** Today it implements LSP stdio framing, full-document
-open/change/close, syntax diagnostics, local property hover/definition,
+open/change/close, syntax and limited type diagnostics, local property hover/definition,
 basic local and amends-schema completion (including public GitHub release
-packages), and in-memory `pkl/fileContents`. The exact limits are tracked in
+packages), limited formatting, an unused-import quick fix, verified public
+package downloads, and `pkl/fileContents` for open documents and downloaded
+package members. The exact limits are tracked in
 [PARITY.md](PARITY.md).
 
 ## Try it
@@ -30,6 +32,10 @@ resolve imports, dependencies, inherited class hierarchies, or arbitrary Pkl
 expressions. GitHub package ZIPs are size-limited and SHA-256 checked against
 the package's public metadata. This is not a full Pkl package trust or
 dependency-resolution implementation; do not open untrusted packages yet.
+Formatting currently handles only spacing around simple top-level assignments
+and the final newline. Type checking handles only direct primitive literals
+with explicit or directly amended property types. Downloads remain in memory
+for the lifetime of the server process.
 
 ## Release preparation (not activated)
 

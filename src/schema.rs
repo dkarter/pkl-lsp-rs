@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use tree_sitter::Node;
 
@@ -65,10 +65,22 @@ fn tree(source: &str) -> Option<tree_sitter::Tree> {
     parser.parse(source, None)
 }
 
-pub fn syntax_errors(source: &str) -> Vec<serde_json::Value> {
+pub fn diagnostics(source: &str, inherited: Option<&Schema>) -> Vec<serde_json::Value> {
     let Some(tree) = tree(source) else {
         return Vec::new();
     };
+    let root = tree.root_node();
+    let mut diagnostics = syntax_errors(root, source);
+    diagnostics.extend(literal_type_errors(root, source, inherited));
+    diagnostics.extend(
+        unused_imports_tree(root, source)
+            .into_iter()
+            .map(|unused| unused.diagnostic),
+    );
+    diagnostics
+}
+
+fn syntax_errors(root: Node<'_>, source: &str) -> Vec<serde_json::Value> {
     let mut errors = Vec::new();
     fn visit(node: Node<'_>, source: &str, errors: &mut Vec<serde_json::Value>) {
         if node.is_error() || node.is_missing() {
@@ -93,8 +105,182 @@ pub fn syntax_errors(source: &str) -> Vec<serde_json::Value> {
             visit(child, source, errors);
         }
     }
-    visit(tree.root_node(), source, &mut errors);
+    visit(root, source, &mut errors);
     errors
+}
+
+fn literal_type_errors(
+    root: Node<'_>,
+    source: &str,
+    inherited: Option<&Schema>,
+) -> Vec<serde_json::Value> {
+    let mut errors = Vec::new();
+    let mut cursor = root.walk();
+    for node in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "classProperty")
+    {
+        let Some(property) = property(node, source) else {
+            continue;
+        };
+        let Some(expected) = property.ty.as_deref().or_else(|| {
+            inherited.and_then(|schema| {
+                schema
+                    .properties
+                    .iter()
+                    .find(|candidate| candidate.name == property.name)
+                    .and_then(|candidate| candidate.ty.as_deref())
+            })
+        }) else {
+            continue;
+        };
+        let mut children = node.walk();
+        let literal = node.named_children(&mut children).find(|child| {
+            matches!(
+                child.kind(),
+                "intLiteralExpr"
+                    | "floatLiteralExpr"
+                    | "slStringLiteralExpr"
+                    | "trueLiteralExpr"
+                    | "falseLiteralExpr"
+            )
+        });
+        let Some(literal) = literal else { continue };
+        let actual = match literal.kind() {
+            "intLiteralExpr" => "Int",
+            "floatLiteralExpr" => "Float",
+            "slStringLiteralExpr" => "String",
+            "trueLiteralExpr" | "falseLiteralExpr" => "Boolean",
+            _ => continue,
+        };
+        if expected == actual || (expected == "Number" && matches!(actual, "Int" | "Float")) {
+            continue;
+        }
+        if !matches!(expected, "Int" | "Float" | "Number" | "String" | "Boolean") {
+            continue;
+        }
+        let start = literal.start_position();
+        let end = literal.end_position();
+        let position = |row: usize, byte: usize| serde_json::json!({"line":row,"character":source.lines().nth(row).and_then(|line| line.get(..byte)).map_or(0, |prefix| prefix.encode_utf16().count())});
+        errors.push(serde_json::json!({
+            "range":{"start":position(start.row,start.column),"end":position(end.row,end.column)},
+            "severity":1,"source":"pkl-lsp-rs","code":"type-mismatch",
+            "message":format!("Expected {expected}, found {actual}")
+        }));
+    }
+    errors
+}
+
+pub struct UnusedImport {
+    pub diagnostic: serde_json::Value,
+    pub edit: serde_json::Value,
+}
+
+pub fn unused_imports(source: &str) -> Vec<UnusedImport> {
+    let Some(tree) = tree(source) else {
+        return Vec::new();
+    };
+    unused_imports_tree(tree.root_node(), source)
+}
+
+fn unused_imports_tree(root: Node<'_>, source: &str) -> Vec<UnusedImport> {
+    let mut cursor = root.walk();
+    let mut unused = Vec::new();
+    let mut referenced = HashSet::new();
+    fn collect_references<'a>(node: Node<'_>, source: &'a str, referenced: &mut HashSet<&'a str>) {
+        if node.kind() == "importClause" {
+            return;
+        }
+        if node.kind() == "identifier"
+            && let Ok(name) = node.utf8_text(source.as_bytes())
+        {
+            referenced.insert(name);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_references(child, source, referenced);
+        }
+    }
+    collect_references(root, source, &mut referenced);
+    for import in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "importClause")
+    {
+        let Some(alias) = direct(import, "identifier") else {
+            continue;
+        };
+        let Ok(name) = alias.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        if referenced.contains(name) {
+            continue;
+        }
+        let line = import.start_position().row;
+        let length = source
+            .lines()
+            .nth(line)
+            .map_or(0, |text| text.encode_utf16().count());
+        let declaration = serde_json::json!({"start":{"line":line,"character":0},"end":{"line":line,"character":length}});
+        let remove_end = if source.lines().nth(line + 1).is_some() {
+            serde_json::json!({"line":line+1,"character":0})
+        } else {
+            serde_json::json!({"line":line,"character":length})
+        };
+        unused.push(UnusedImport {
+            diagnostic: serde_json::json!({"range":declaration,"severity":2,"source":"pkl-lsp-rs","code":"unused-import","message":format!("Unused import `{name}`")}),
+            edit: serde_json::json!({"range":{"start":{"line":line,"character":0},"end":remove_end},"newText":""}),
+        });
+    }
+    unused
+}
+
+pub fn format_edits(source: &str) -> Vec<serde_json::Value> {
+    let Some(tree) = tree(source) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+    let mut edits = Vec::new();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for property in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "classProperty")
+    {
+        let Some(identifier) = direct(property, "identifier") else {
+            continue;
+        };
+        let mut children = property.walk();
+        let value = property.named_children(&mut children).last();
+        let Some(value) = value.filter(|value| {
+            value.start_byte() > identifier.end_byte() && value.kind() != "typeAnnotation"
+        }) else {
+            continue;
+        };
+        let Some(gap) = source.get(identifier.end_byte()..value.start_byte()) else {
+            continue;
+        };
+        if gap.trim() != "=" || gap == " = " {
+            continue;
+        }
+        let position = |byte: usize| {
+            let before = &source[..byte];
+            serde_json::json!({"line":before.bytes().filter(|byte| *byte == b'\n').count(),"character":before.rsplit('\n').next().unwrap_or("").encode_utf16().count()})
+        };
+        edits.push(serde_json::json!({"range":{"start":position(identifier.end_byte()),"end":position(value.start_byte())},"newText":" = "}));
+    }
+    if !source.is_empty() && !source.ends_with('\n') {
+        let row = source.bytes().filter(|byte| *byte == b'\n').count();
+        let col = source
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .encode_utf16()
+            .count();
+        edits.push(serde_json::json!({"range":{"start":{"line":row,"character":col},"end":{"line":row,"character":col}},"newText":"\n"}));
+    }
+    edits
 }
 
 pub fn documentation_tokens(source: &str) -> Vec<usize> {
@@ -114,7 +300,16 @@ pub fn documentation_tokens(source: &str) -> Vec<usize> {
                         let name = &line[start + 1..end];
                         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
                         {
-                            let character = line[..start].encode_utf16().count();
+                            let base = if offset == 0 {
+                                source
+                                    .lines()
+                                    .nth(node.start_position().row)
+                                    .and_then(|line| line.get(..node.start_position().column))
+                                    .map_or(0, |prefix| prefix.encode_utf16().count())
+                            } else {
+                                0
+                            };
+                            let character = base + line[..start].encode_utf16().count();
                             spans.push((
                                 node.start_position().row + offset,
                                 character,
@@ -258,9 +453,27 @@ pub fn object_context(source: &str, line: usize, column: usize) -> Option<String
 }
 
 pub fn package_module(uri: &str) -> Option<String> {
-    const LIMIT: u64 = MAX_MODULE_BYTES;
     let (package, member) = uri.strip_prefix("package://")?.split_once("#/")?;
+    let archive = package_archive(&format!("package://{package}"))?;
+    package_member(&archive, member)
+}
+
+pub fn package_member(bytes: &[u8], member: &str) -> Option<String> {
     if member.is_empty() || member.starts_with('/') || member.split('/').any(|part| part == "..") {
+        return None;
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
+    let file = archive.by_name(member).ok()?;
+    let mut source = String::new();
+    file.take(MAX_MODULE_BYTES + 1)
+        .read_to_string(&mut source)
+        .ok()?;
+    (source.len() as u64 <= MAX_MODULE_BYTES).then_some(source)
+}
+
+pub fn package_archive(uri: &str) -> Option<Vec<u8>> {
+    let package = uri.strip_prefix("package://")?;
+    if package.contains('#') {
         return None;
     }
     let metadata_url = url::Url::parse(&format!("https://{package}")).ok()?;
@@ -284,20 +497,13 @@ pub fn package_module(uri: &str) -> Option<String> {
         return None;
     }
     let checksum = metadata["packageZipChecksums"]["sha256"].as_str()?;
-    let bytes = fetch(&agent, url.as_str(), LIMIT)?;
+    let bytes = fetch(&agent, url.as_str(), MAX_MODULE_BYTES)?;
     if checksum.len() != 64
         || format!("{:x}", Sha256::digest(&bytes)) != checksum.to_ascii_lowercase()
     {
         return None;
     }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
-    let file = archive.by_name(member).ok()?;
-    let mut source = String::new();
-    file.take(LIMIT + 1).read_to_string(&mut source).ok()?;
-    if source.len() as u64 > LIMIT {
-        return None;
-    }
-    Some(source)
+    Some(bytes)
 }
 
 fn fetch(agent: &ureq::Agent, url: &str, limit: u64) -> Option<Vec<u8>> {
