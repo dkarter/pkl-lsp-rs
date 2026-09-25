@@ -7,6 +7,7 @@ use tree_sitter::Node;
 pub struct Property {
     pub name: String,
     pub ty: Option<String>,
+    pub documentation: Option<String>,
     pub line: usize,
     pub character: usize,
 }
@@ -361,10 +362,25 @@ fn property(node: Node<'_>, source: &str) -> Option<Property> {
         .and_then(|declared| direct(declared, "qualifiedIdentifier"))
         .and_then(|identifier| identifier.utf8_text(source.as_bytes()).ok())
         .map(str::to_owned);
+    let documentation = direct(node, "docComment")
+        .and_then(|comment| comment.utf8_text(source.as_bytes()).ok())
+        .map(|comment| {
+            comment
+                .lines()
+                .map(|line| {
+                    line.trim_start()
+                        .strip_prefix("///")
+                        .unwrap_or(line)
+                        .trim_start()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
     let line = source.lines().nth(identifier.start_position().row)?;
     Some(Property {
         name,
         ty,
+        documentation,
         line: identifier.start_position().row,
         character: line
             .get(..identifier.start_position().column)?
@@ -393,6 +409,61 @@ pub fn word_at(source: &str, line: usize, column: usize) -> Option<&str> {
         .find(|c: char| !identifier(c))
         .map_or(line.len(), |i| byte + i);
     (start < end).then_some(&line[start..end])
+}
+
+pub fn module_uri_completions(
+    uri: &str,
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Option<Vec<serde_json::Value>> {
+    let row = source.lines().nth(line)?;
+    let mut utf16 = 0;
+    let end = row
+        .char_indices()
+        .find_map(|(byte, c)| {
+            if utf16 >= column {
+                return Some(byte);
+            }
+            utf16 += c.len_utf16();
+            None
+        })
+        .unwrap_or(row.len());
+    let prefix = row.get(..end)?.trim_start();
+    let quoted = ["import", "amends", "extends"]
+        .into_iter()
+        .find_map(|keyword| prefix.strip_prefix(keyword)?.trim_start().strip_prefix('"'))?;
+    if quoted.contains('"') {
+        return None;
+    }
+    if quoted.starts_with("package://") {
+        return Some(Vec::new());
+    }
+    let path = url::Url::parse(uri).ok()?.to_file_path().ok()?;
+    let (folder, needle) = quoted.rsplit_once('/').unwrap_or(("", quoted));
+    let directory = path.parent()?.join(folder);
+    let mut items: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .take(1000)
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(needle) || name.starts_with('.') {
+                return None;
+            }
+            let metadata = entry.file_type().ok()?;
+            if metadata.is_dir() {
+                Some(serde_json::json!({"label":format!("{name}/"),"kind":19}))
+            } else if metadata.is_file() && name.ends_with(".pkl") {
+                Some(serde_json::json!({"label":name,"kind":17}))
+            } else {
+                None
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| a["label"].as_str().cmp(&b["label"].as_str()));
+    items.truncate(100);
+    Some(items)
 }
 
 pub fn amends_uri(source: &str) -> Option<&str> {

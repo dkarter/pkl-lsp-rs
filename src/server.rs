@@ -1,6 +1,6 @@
 use crate::schema;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, Read, Write};
 use std::time::{Duration, Instant};
 
@@ -103,7 +103,7 @@ impl Server {
         let result = match method {
             "initialize" => json!({"capabilities": {
                 "textDocumentSync": 1,
-                "completionProvider": {"resolveProvider": false, "triggerCharacters": [".", "/", "\"", ":"]},
+                "completionProvider": {"resolveProvider": true, "triggerCharacters": [".", "/", "\"", ":"]},
                 "hoverProvider": true,
                 "definitionProvider": true,
                 "codeActionProvider": {"codeActionKinds":["quickfix"]},
@@ -187,6 +187,12 @@ impl Server {
                 let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
                 let text = self.documents.get(uri).cloned();
                 json!(text.map_or_else(Vec::new, |text| {
+                    let line = params["position"]["line"].as_u64().unwrap_or(u64::MAX) as usize;
+                    let column =
+                        params["position"]["character"].as_u64().unwrap_or(u64::MAX) as usize;
+                    if let Some(items) = schema::module_uri_completions(uri, &text, line, column) {
+                        return items;
+                    }
                     let inherited = self.inherited_schema(uri, &text);
                     completion(
                         &text,
@@ -194,6 +200,16 @@ impl Server {
                         inherited.as_ref().map(|(_, schema)| schema),
                     )
                 }))
+            }
+            "completionItem/resolve" => {
+                let mut item = params.clone();
+                if let Some(ty) = params["data"]["type"].as_str() {
+                    item["detail"] = json!(ty);
+                }
+                if let Some(documentation) = params["data"]["documentation"].as_str() {
+                    item["documentation"] = json!({"kind":"markdown","value":documentation});
+                }
+                item
             }
             "textDocument/hover" | "textDocument/definition" => {
                 let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
@@ -222,7 +238,16 @@ impl Server {
                 });
                 match (method, symbol) {
                     ("textDocument/hover", Some((_, property))) => {
-                        json!({"contents":{"kind":"markdown","value":format!("```pkl\n{}: {}\n```",property.name,property.ty.unwrap_or_else(|| "unknown".to_owned()))}})
+                        let mut value = format!(
+                            "```pkl\n{}: {}\n```",
+                            property.name,
+                            property.ty.unwrap_or_else(|| "unknown".to_owned())
+                        );
+                        if let Some(documentation) = property.documentation {
+                            value.push_str("\n\n");
+                            value.push_str(&documentation);
+                        }
+                        json!({"contents":{"kind":"markdown","value":value}})
                     }
                     ("textDocument/definition", Some((target, property))) => {
                         json!([{"uri":target,"range":{"start":{"line":property.line,"character":property.character},"end":{"line":property.line,"character":property.character + property.name.encode_utf16().count()}}}])
@@ -404,12 +429,22 @@ fn completion(text: &str, position: &Value, inherited: Option<&schema::Schema>) 
         .rev()
         .collect();
     let local = schema::parse(text);
-    let mut names: Vec<&str> = local
-        .iter()
-        .flat_map(|schema| schema.properties.iter())
-        .map(|property| property.name.as_str())
-        .filter(|name| name.starts_with(&word) && *name != word)
-        .collect();
+    let mut names = BTreeMap::new();
+    let mut add = |property: &schema::Property| {
+        if property.name.starts_with(&word) && property.name != word {
+            names.entry(property.name.clone()).or_insert_with(|| {
+                json!({
+                    "label":property.name,"kind":10,
+                    "data":{"type":property.ty,"documentation":property.documentation}
+                })
+            });
+        }
+    };
+    if let Some(local) = local.as_ref() {
+        for property in &local.properties {
+            add(property);
+        }
+    }
     if let Some(schema) = inherited {
         let properties = if let Some(object) = schema::object_context(text, line, column) {
             schema
@@ -422,17 +457,9 @@ fn completion(text: &str, position: &Value, inherited: Option<&schema::Schema>) 
         } else {
             schema.properties.as_slice()
         };
-        names.extend(
-            properties
-                .iter()
-                .map(|property| property.name.as_str())
-                .filter(|name| name.starts_with(&word) && *name != word),
-        );
+        for property in properties {
+            add(property);
+        }
     }
-    names.sort_unstable();
-    names.dedup();
-    names
-        .into_iter()
-        .map(|label| json!({"label":label, "kind":10}))
-        .collect()
+    names.into_values().collect()
 }

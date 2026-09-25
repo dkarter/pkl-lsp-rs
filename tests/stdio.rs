@@ -253,6 +253,52 @@ fn hover_and_definition_resolve_local_amends_schema() {
 }
 
 #[test]
+fn completion_item_resolves_schema_documentation() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/documented-base.pkl","languageId":"pkl","version":1,"text":"module Base\n/// The greeting.\ngreeting: String"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/documented-child.pkl","languageId":"pkl","version":1,"text":"amends \"./documented-base.pkl\"\ngree"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/documented-child.pkl"},"position":{"line":1,"character":4}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"completionItem/resolve","params":{"label":"greeting","kind":10,"data":{"type":"String","documentation":"The greeting."}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(
+        result[0]["result"]["capabilities"]["completionProvider"]["resolveProvider"],
+        true
+    );
+    assert_eq!(
+        result[1]["result"][0]["data"]["documentation"],
+        "The greeting."
+    );
+    assert_eq!(
+        result[2]["result"]["documentation"]["value"],
+        "The greeting."
+    );
+    assert_eq!(result[2]["result"]["detail"], "String");
+}
+
+#[test]
+fn module_uri_completion_lists_neighboring_pkl_files() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let uri = format!("file://{root}/tests/fixtures/editing.pkl");
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"pkl","version":1,"text":"import \"./sc\""}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":0,"character":12}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert!(
+        result[1]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "schema.pkl")
+    );
+}
+
+#[test]
 fn semantic_tokens_highlight_documentation_member_links() {
     let result = exchange(&[
         initialize(),
