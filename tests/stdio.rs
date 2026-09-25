@@ -279,6 +279,43 @@ fn qualified_import_property_hover_and_definition_use_open_module() {
 }
 
 #[test]
+fn qualified_import_completion_uses_open_module_not_local_properties() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/completion-base.pkl","languageId":"pkl","version":1,"text":"module Base\nfeatureFlag: Boolean"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/completion-child.pkl","languageId":"pkl","version":1,"text":"import \"./completion-base.pkl\" as Base\nlocal = 1\nvalue = Base.fea"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/completion-child.pkl"},"position":{"line":2,"character":16}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    let items = result[1]["result"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["label"] == "featureFlag"));
+    assert!(!items.iter().any(|item| item["label"] == "local"));
+}
+
+#[test]
+fn qualified_import_completion_reads_local_fixture_from_disk() {
+    let uri = format!(
+        "file://{}/tests/fixtures/editing.pkl",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"pkl","version":1,"text":"import \"./schema.pkl\" as Schema\nvalue = Schema.fea"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":18}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert!(
+        result[1]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["label"] == "featureFlag")
+    );
+}
+
+#[test]
 fn hover_and_definition_resolve_local_amends_schema() {
     let result = exchange(&[
         initialize(),

@@ -196,11 +196,23 @@ impl Server {
                     if let Some(items) = schema::module_uri_completions(uri, &text, line, column) {
                         return items;
                     }
+                    if let Some((import, _)) = column
+                        .checked_sub(1)
+                        .and_then(|column| schema::qualified_import_at(&text, line, column))
+                    {
+                        return self.local_import_schema(uri, import).map_or_else(
+                            Vec::new,
+                            |(_, imported)| {
+                                completion(&text, &params["position"], Some(&imported), false)
+                            },
+                        );
+                    }
                     let inherited = self.inherited_schema(uri, &text);
                     completion(
                         &text,
                         &params["position"],
                         inherited.as_ref().map(|(_, schema)| schema),
+                        true,
                     )
                 }))
             }
@@ -224,25 +236,12 @@ impl Server {
                     let word = schema::word_at(text, line, character)?;
                     if let Some((import, name)) = schema::qualified_import_at(text, line, character)
                     {
-                        let target = url::Url::parse(uri).ok()?.join(import).ok()?;
-                        if target.scheme() != "file" {
-                            return None;
-                        }
-                        let source =
-                            self.documents.get(target.as_str()).cloned().or_else(|| {
-                                let mut source = String::new();
-                                std::fs::File::open(target.to_file_path().ok()?)
-                                    .ok()?
-                                    .take(schema::MAX_MODULE_BYTES + 1)
-                                    .read_to_string(&mut source)
-                                    .ok()?;
-                                (source.len() as u64 <= schema::MAX_MODULE_BYTES).then_some(source)
-                            })?;
-                        let property = schema::parse(&source)?
+                        let (target, imported) = self.local_import_schema(uri, import)?;
+                        let property = imported
                             .properties
                             .into_iter()
                             .find(|property| property.name == name)?;
-                        return Some((target.into(), property));
+                        return Some((target, property));
                     }
                     let inherited =
                         self.inherited_schema(uri, text)
@@ -348,6 +347,23 @@ impl Server {
 }
 
 impl Server {
+    fn local_import_schema(&self, uri: &str, import: &str) -> Option<(String, schema::Schema)> {
+        let target = url::Url::parse(uri).ok()?.join(import).ok()?;
+        if target.scheme() != "file" {
+            return None;
+        }
+        let source = self.documents.get(target.as_str()).cloned().or_else(|| {
+            let mut source = String::new();
+            std::fs::File::open(target.to_file_path().ok()?)
+                .ok()?
+                .take(schema::MAX_MODULE_BYTES + 1)
+                .read_to_string(&mut source)
+                .ok()?;
+            (source.len() as u64 <= schema::MAX_MODULE_BYTES).then_some(source)
+        })?;
+        Some((target.into(), schema::parse(&source)?))
+    }
+
     fn republish_dependents(&mut self, changed: &str) {
         let dependents: Vec<_> = self
             .documents
@@ -427,7 +443,12 @@ impl Server {
     }
 }
 
-fn completion(text: &str, position: &Value, inherited: Option<&schema::Schema>) -> Vec<Value> {
+fn completion(
+    text: &str,
+    position: &Value,
+    inherited: Option<&schema::Schema>,
+    include_local: bool,
+) -> Vec<Value> {
     let line = position["line"].as_u64().unwrap_or(u64::MAX) as usize;
     let column = position["character"].as_u64().unwrap_or(u64::MAX) as usize;
     let Some(current_line) = text.lines().nth(line) else {
@@ -453,7 +474,6 @@ fn completion(text: &str, position: &Value, inherited: Option<&schema::Schema>) 
         .chars()
         .rev()
         .collect();
-    let local = schema::parse(text);
     let mut names = BTreeMap::new();
     let mut add = |property: &schema::Property| {
         if property.name.starts_with(&word) && property.name != word {
@@ -465,7 +485,7 @@ fn completion(text: &str, position: &Value, inherited: Option<&schema::Schema>) 
             });
         }
     };
-    if let Some(local) = local.as_ref() {
+    if let Some(local) = include_local.then(|| schema::parse(text)).flatten() {
         for property in &local.properties {
             add(property);
         }
