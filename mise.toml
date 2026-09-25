@@ -1,0 +1,35 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+
+[tools]
+"github:crate-ci/committed" = "latest"
+"aqua:rhysd/actionlint" = "1.7.12"
+dprint = "latest"
+fnox = "latest"
+gitleaks = "latest"
+hk = "latest"
+pitchfork = "latest"
+rust = { version = "1.98.1", mr_boxington = true }
+mr-boxington = "1.17.0"
+
+[hooks]
+postinstall = "hk install --mise"
+
+[tasks.fmt]
+description = "Formats all supported files"
+run = "cargo fmt --all && dprint fmt"
+
+[tasks.fmt-check]
+description = "Checks formatting and fails on differences"
+run = "cargo fmt --all -- --check && dprint check"
+
+[tasks.test]
+description = "Run Rust tests including real stdio protocol tests"
+run = "mbx test --locked --all-targets"
+
+[tasks.lint]
+description = "Lint Rust code"
+run = "mbx clippy --locked --all-targets -- -D warnings"
+
+[tasks.workflow-check]
+description = "Validate GitHub workflows"
+run = "actionlint"
