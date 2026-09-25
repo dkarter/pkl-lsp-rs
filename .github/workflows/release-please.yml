@@ -138,6 +138,7 @@ jobs:
           mkdir -p dist/package
           cp "target/${TARGET}/release/pkl-lsp-rs${EXT}" dist/package/
           cp README.md LICENSE dist/package/
+          cp -R THIRD_PARTY_LICENSES dist/package/
           asset="dist/pkl-lsp-rs_${VERSION}_${OS}_${ARCH}.${ARCHIVE}"
           if [[ "$ARCHIVE" == zip ]]; then
             (cd dist/package && 7z a "../$(basename "$asset")" ./*)

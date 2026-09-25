@@ -26,6 +26,10 @@ run = "cargo fmt --all -- --check && dprint check"
 description = "Run Rust tests including real stdio protocol tests"
 run = "mbx test --locked --all-targets"
 
+[tasks.test-e2e]
+description = "Use isolated Neovim and Blink against the public hk package (network required)"
+run = "bash tests/run-neovim-blink.sh"
+
 [tasks.lint]
 description = "Lint Rust code"
 run = "mbx clippy --locked --all-targets -- -D warnings"
