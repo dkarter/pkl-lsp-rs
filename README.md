@@ -6,7 +6,8 @@ open/change/close, syntax and limited type diagnostics, local property hover/def
 basic local and amends-schema completion (including public GitHub release
 packages), limited formatting, an unused-import quick fix, verified public
 package downloads, and `pkl/fileContents` for open documents and downloaded
-package members. The exact limits are tracked in
+package members. Explicitly aliased local imports support property hover and
+definition. The exact limits are tracked in
 [PARITY.md](PARITY.md).
 
 ## Try it

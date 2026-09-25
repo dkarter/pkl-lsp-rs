@@ -411,6 +411,61 @@ pub fn word_at(source: &str, line: usize, column: usize) -> Option<&str> {
     (start < end).then_some(&line[start..end])
 }
 
+pub fn qualified_import_at(source: &str, line: usize, column: usize) -> Option<(&str, &str)> {
+    let row = source.lines().nth(line)?;
+    let mut units = 0;
+    let byte = row
+        .char_indices()
+        .find_map(|(byte, c)| {
+            if units >= column {
+                return Some(byte);
+            }
+            units += c.len_utf16();
+            None
+        })
+        .unwrap_or(row.len());
+    let tree = tree(source)?;
+    let point = tree_sitter::Point::new(line, byte);
+    let node = tree
+        .root_node()
+        .named_descendant_for_point_range(point, point)?;
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let access = node.parent()?;
+    if access.kind() != "qualifiedAccessExpr" || direct(access, "identifier")?.id() != node.id() {
+        return None;
+    }
+    let receiver = access.child_by_field_name("receiver")?;
+    if receiver.kind() != "unqualifiedAccessExpr" {
+        return None;
+    }
+    let alias = direct(receiver, "identifier")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    let name = node.utf8_text(source.as_bytes()).ok()?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for import in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "importClause")
+    {
+        let Some(import_alias) =
+            direct(import, "identifier").and_then(|node| node.utf8_text(source.as_bytes()).ok())
+        else {
+            continue;
+        };
+        if import_alias != alias {
+            continue;
+        }
+        let literal = direct(import, "stringConstant")?
+            .utf8_text(source.as_bytes())
+            .ok()?;
+        return Some((literal.strip_prefix('"')?.strip_suffix('"')?, name));
+    }
+    None
+}
+
 pub fn module_uri_completions(
     uri: &str,
     source: &str,

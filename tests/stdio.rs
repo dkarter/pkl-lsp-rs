@@ -79,6 +79,32 @@ fn syntax_diagnostics_are_published_and_cleared_on_change() {
 }
 
 #[test]
+fn stale_or_ranged_full_sync_changes_do_not_replace_newer_document() {
+    let uri = "file:///tmp/versioned.pkl";
+    let messages = exchange_all(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"pkl","version":4,"text":"original: String = 1"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":5},"contentChanges":[{"text":"current: Int = 1"}]}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":3},"contentChanges":[{"text":"stale: String = 1"}]}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":6},"contentChanges":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"corrupt"}]}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/fileContents","params":{"uri":uri}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["method"] == "textDocument/publishDiagnostics")
+            .count(),
+        2
+    );
+    assert_eq!(
+        messages.iter().find(|m| m["id"] == 2).unwrap()["result"],
+        "current: Int = 1"
+    );
+}
+
+#[test]
 fn typed_literal_mismatch_diagnostic_clears_when_fixed() {
     let messages = exchange_all(&[
         initialize(),
@@ -225,6 +251,30 @@ fn hover_and_definition_resolve_local_typed_property() {
     assert_eq!(
         result[2]["result"][0]["range"]["start"],
         json!({"line":0,"character":0})
+    );
+}
+
+#[test]
+fn qualified_import_property_hover_and_definition_use_open_module() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/import-base.pkl","languageId":"pkl","version":1,"text":"module Base\n/// Imported property.\ngreeting: String"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/import-child.pkl","languageId":"pkl","version":1,"text":"import \"./other.pkl\"\nimport \"./import-base.pkl\" as Base\nvalue = Base.greeting"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tmp/import-child.pkl"},"position":{"line":2,"character":16}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/import-child.pkl"},"position":{"line":2,"character":16}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert!(
+        result[1]["result"]["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("Imported property.")
+    );
+    assert_eq!(result[2]["result"][0]["uri"], "file:///tmp/import-base.pkl");
+    assert_eq!(
+        result[2]["result"][0]["range"]["start"],
+        json!({"line":2,"character":0})
     );
 }
 

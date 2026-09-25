@@ -130,20 +130,23 @@ impl Server {
                 return None;
             }
             "textDocument/didChange" => {
-                if let (Some(uri), Some(text)) = (
+                if let (Some(uri), Some(version), Some(changes)) = (
                     params["textDocument"]["uri"].as_str(),
-                    params["contentChanges"]
-                        .as_array()
-                        .and_then(|changes| changes.last())
-                        .and_then(|change| change["text"].as_str()),
-                ) && let Some(document) = self.documents.get_mut(uri)
+                    params["textDocument"]["version"].as_i64(),
+                    params["contentChanges"].as_array(),
+                ) && let [change] = changes.as_slice()
+                    && change.get("range").is_none()
+                    && change.get("rangeLength").is_none()
+                    && let Some(text) = change["text"].as_str()
+                    && self.documents.contains_key(uri)
+                    && self
+                        .document_versions
+                        .get(uri)
+                        .is_some_and(|previous| version > *previous)
                 {
-                    *document = text.to_owned();
-                    let version = params["textDocument"]["version"].as_i64();
-                    if let Some(version) = version {
-                        self.document_versions.insert(uri.to_owned(), version);
-                    }
-                    self.publish_diagnostics(uri, text, version);
+                    self.documents.insert(uri.to_owned(), text.to_owned());
+                    self.document_versions.insert(uri.to_owned(), version);
+                    self.publish_diagnostics(uri, text, Some(version));
                     self.republish_dependents(uri);
                 }
                 return None;
@@ -219,6 +222,28 @@ impl Server {
                 let text = self.documents.get(uri).cloned();
                 let symbol = text.as_deref().and_then(|text| {
                     let word = schema::word_at(text, line, character)?;
+                    if let Some((import, name)) = schema::qualified_import_at(text, line, character)
+                    {
+                        let target = url::Url::parse(uri).ok()?.join(import).ok()?;
+                        if target.scheme() != "file" {
+                            return None;
+                        }
+                        let source =
+                            self.documents.get(target.as_str()).cloned().or_else(|| {
+                                let mut source = String::new();
+                                std::fs::File::open(target.to_file_path().ok()?)
+                                    .ok()?
+                                    .take(schema::MAX_MODULE_BYTES + 1)
+                                    .read_to_string(&mut source)
+                                    .ok()?;
+                                (source.len() as u64 <= schema::MAX_MODULE_BYTES).then_some(source)
+                            })?;
+                        let property = schema::parse(&source)?
+                            .properties
+                            .into_iter()
+                            .find(|property| property.name == name)?;
+                        return Some((target.into(), property));
+                    }
                     let inherited =
                         self.inherited_schema(uri, text)
                             .and_then(|(target, schema)| {
