@@ -11,15 +11,17 @@ fn exchange(messages: &[Value]) -> Vec<Value> {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let mut stdin = process.stdin.take().unwrap();
+    let mut stdin = process.stdin.take().unwrap();
+    let messages = messages.to_vec();
+    let writer = std::thread::spawn(move || {
         for message in messages {
-            let bytes = serde_json::to_vec(message).unwrap();
+            let bytes = serde_json::to_vec(&message).unwrap();
             write!(stdin, "Content-Length: {}\r\n\r\n", bytes.len()).unwrap();
             stdin.write_all(&bytes).unwrap();
         }
-    }
+    });
     let output = process.wait_with_output().unwrap();
+    writer.join().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -86,7 +88,50 @@ fn unsupported_request_is_not_silently_successful() {
     let result = exchange(&[
         initialize(),
         json!({"jsonrpc":"2.0","id":9,"method":"pkl/downloadPackage","params":"not-a-package"}),
+        json!({"jsonrpc":"2.0","id":10,"method":"shutdown"}),
         json!({"jsonrpc":"2.0","method":"exit"}),
     ]);
     assert_eq!(result[1]["error"]["code"], -32601);
+}
+
+#[test]
+fn completion_uses_utf16_offsets_after_non_bmp_characters() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/unicode.pkl","languageId":"pkl","version":1,"text":"firstName = 1\n😀firX"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/unicode.pkl"},"position":{"line":1,"character":5}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["result"][0]["label"], "firstName");
+}
+
+#[test]
+fn requests_after_shutdown_are_rejected() {
+    let result = exchange(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/empty.pkl"},"position":{"line":0,"character":0}}}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[2]["error"]["code"], -32600);
+}
+
+#[test]
+fn exit_without_shutdown_fails() {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_pkl-lsp-rs"))
+        .env("PATH", "/nonexistent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"exit"})).unwrap();
+    let mut stdin = process.stdin.take().unwrap();
+    write!(stdin, "Content-Length: {}\r\n\r\n", bytes.len()).unwrap();
+    stdin.write_all(&bytes).unwrap();
+    drop(stdin);
+    let output = process.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
 }

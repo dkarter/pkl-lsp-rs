@@ -12,7 +12,11 @@ pub fn run(mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     let mut server = Server::default();
     while let Some(message) = read_message(&mut input)? {
         if message.get("method").and_then(Value::as_str) == Some("exit") {
-            break;
+            return if server.shutdown {
+                Ok(())
+            } else {
+                Err(io::Error::other("exit before shutdown"))
+            };
         }
         if let Some(response) = server.handle(&message) {
             let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
@@ -25,15 +29,22 @@ pub fn run(mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 }
 
 fn read_message(input: &mut impl BufRead) -> io::Result<Option<Value>> {
+    const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
     let mut length = None;
     loop {
         let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
+        if io::Read::take(&mut *input, 8192).read_line(&mut line)? == 0 {
             return if length.is_none() {
                 Ok(None)
             } else {
                 Err(io::Error::from(io::ErrorKind::UnexpectedEof))
             };
+        }
+        if !line.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LSP header too long",
+            ));
         }
         if line.trim().is_empty() {
             break;
@@ -52,6 +63,12 @@ fn read_message(input: &mut impl BufRead) -> io::Result<Option<Value>> {
         }
     }
     let size = length.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    if size > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LSP message exceeds 32 MiB",
+        ));
+    }
     let mut body = vec![0; size];
     input.read_exact(&mut body)?;
     serde_json::from_slice(&body)
@@ -62,6 +79,11 @@ fn read_message(input: &mut impl BufRead) -> io::Result<Option<Value>> {
 impl Server {
     fn handle(&mut self, message: &Value) -> Option<Value> {
         let method = message.get("method")?.as_str()?;
+        if self.shutdown {
+            return message.get("id").map(|id| {
+                json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32600,"message":"Server has shut down"}})
+            });
+        }
         let params = &message["params"];
         let result = match method {
             "initialize" => json!({"capabilities": {
@@ -127,10 +149,17 @@ fn completion(text: &str, position: &Value) -> Vec<Value> {
     let Some(current_line) = text.lines().nth(line) else {
         return Vec::new();
     };
+    let mut units = 0;
     let prefix: String = current_line
         .chars()
-        .take_while(|_| true)
-        .take(column)
+        .take_while(|character| {
+            let next = units + character.len_utf16();
+            if next > column {
+                return false;
+            }
+            units = next;
+            true
+        })
         .collect();
     let word: String = prefix
         .chars()
