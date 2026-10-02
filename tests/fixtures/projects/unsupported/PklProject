@@ -1,0 +1,4 @@
+amends "pkl:Project"
+dependencies {
+  ["remote"] { uri = "package://example.invalid/library@1.0.0" }
+}

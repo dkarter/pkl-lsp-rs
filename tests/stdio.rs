@@ -607,6 +607,441 @@ fn initialize() -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}})
 }
 
+fn project_initialize(name: &str) -> Value {
+    let root = url::Url::from_directory_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/projects")
+            .join(name),
+    )
+    .unwrap();
+    json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"workspaceFolders":[{"uri":root.as_str(),"name":name}]}})
+}
+
+#[test]
+fn sync_projects_resolves_literal_local_dependency_after_explicit_sync() {
+    let root = project_initialize("app");
+    let uri = format!(
+        "{}editing.pkl",
+        root["params"]["workspaceFolders"][0]["uri"]
+            .as_str()
+            .unwrap()
+    );
+    let definition = url::Url::from_file_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/projects/library/Schema.pkl"),
+    )
+    .unwrap();
+    let result = exchange(&[
+        root,
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"pkl","version":1,"text":"amends \"@library/Schema.pkl\"\nfea"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":3}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"pkl/syncProjects","params":null}),
+        json!({"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":3}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"import \"@library/Schema.pkl\" as Lib\nvalue = Lib.featureFlag"}]}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":18}}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":18}}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"pkl/syncProjects"}),
+        json!({"jsonrpc":"2.0","id":8,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["result"], json!([]));
+    assert_eq!(result[2], json!({"jsonrpc":"2.0","id":3,"result":null}));
+    assert_eq!(result[3]["result"][0]["label"], "featureFlag");
+    assert_eq!(result[4]["result"][0]["uri"], definition.as_str());
+    assert!(
+        result[5]["result"]["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic local dependency")
+    );
+    assert_eq!(result[6], json!({"jsonrpc":"2.0","id":7,"result":null}));
+}
+
+#[test]
+fn sync_projects_rejects_unsupported_declarations_and_non_file_workspaces() {
+    let result = exchange(&[
+        project_initialize("unsupported"),
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["error"]["code"], -32000);
+    let result = exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspaceFolders":[{"uri":"https://example.invalid/","name":"remote"}]}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["error"]["code"], -32000);
+}
+
+#[test]
+fn synced_dependency_members_reject_traversal_and_unknown_aliases() {
+    let root = project_initialize("app");
+    let uri = format!(
+        "{}editing.pkl",
+        root["params"]["workspaceFolders"][0]["uri"]
+            .as_str()
+            .unwrap()
+    );
+    let mut messages = vec![
+        root,
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}),
+    ];
+    for (index, import) in [
+        "@missing/Schema.pkl",
+        "@library/../library/Schema.pkl",
+        "@library/%2e%2e/library/Schema.pkl",
+        "@library//Schema.pkl",
+        "@library/./Schema.pkl",
+        "@library/Schema.pkl?query",
+    ]
+    .iter()
+    .enumerate()
+    {
+        messages.push(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"version":1,"text":format!("amends \"{import}\"\nfea")}}}));
+        messages.push(json!({"jsonrpc":"2.0","id":index + 3,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":3}}}));
+    }
+    messages.push(json!({"jsonrpc":"2.0","id":20,"method":"shutdown"}));
+    messages.push(json!({"jsonrpc":"2.0","method":"exit"}));
+    let result = exchange(&messages);
+    for response in &result[2..result.len() - 1] {
+        assert_eq!(response["result"], json!([]));
+    }
+}
+
+/// Interactive stdio client for tests that change public synthetic files between requests.
+struct ProjectClient {
+    process: std::process::Child,
+    input: std::process::ChildStdin,
+    responses: std::sync::mpsc::Receiver<Value>,
+}
+
+impl ProjectClient {
+    fn new(root: &std::path::Path) -> Self {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pkl-lsp-rs"))
+            .env("PATH", "/nonexistent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = process.stdout.take().unwrap();
+        let (sender, responses) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read};
+            let mut output = std::io::BufReader::new(stdout);
+            loop {
+                let mut header = String::new();
+                if output.by_ref().take(8192).read_line(&mut header).unwrap() == 0 {
+                    break;
+                }
+                let length: usize = header
+                    .trim()
+                    .strip_prefix("Content-Length: ")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(length <= 32 * 1024 * 1024);
+                let mut blank = String::new();
+                output.by_ref().take(8192).read_line(&mut blank).unwrap();
+                let mut body = vec![0; length];
+                output.read_exact(&mut body).unwrap();
+                if sender.send(serde_json::from_slice(&body).unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client = Self {
+            input: process.stdin.take().unwrap(),
+            responses,
+            process,
+        };
+        let uri = url::Url::from_directory_path(root).unwrap();
+        client.request(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":uri.as_str()}}),
+        );
+        client
+    }
+
+    fn send(&mut self, message: Value) {
+        let body = serde_json::to_vec(&message).unwrap();
+        write!(self.input, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+        self.input.write_all(&body).unwrap();
+        self.input.flush().unwrap();
+    }
+
+    fn request(&mut self, message: Value) -> Value {
+        let id = message["id"].clone();
+        self.send(message);
+        loop {
+            let response = match self
+                .responses
+                .recv_timeout(std::time::Duration::from_secs(5))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = self.process.kill();
+                    let _ = self.process.wait();
+                    panic!("stdio request {id} did not complete: {error}");
+                }
+            };
+            if response["id"] == id {
+                return response;
+            }
+        }
+    }
+}
+
+impl Drop for ProjectClient {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = self.process.kill();
+        } else {
+            self.request(json!({"jsonrpc":"2.0","id":999,"method":"shutdown"}));
+            self.send(json!({"jsonrpc":"2.0","method":"exit"}));
+        }
+        let status = self.process.wait().unwrap();
+        if !std::thread::panicking() {
+            assert!(status.success());
+        }
+    }
+}
+
+fn synthetic_project_root(name: &str) -> std::path::PathBuf {
+    // Generated fixtures stay under ignored target/, never in user configuration.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/stdio-projects")
+        .join(format!("{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    root.canonicalize().unwrap()
+}
+
+#[test]
+fn project_resync_reloads_disk_and_invalidates_failed_or_removed_mappings() {
+    let root = synthetic_project_root("reload");
+    let lib = root.join("library");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("PklProject"), "amends \"pkl:Project\"").unwrap();
+    std::fs::write(lib.join("Schema.pkl"), "featureFlag: Boolean").unwrap();
+    let project = root.join("PklProject");
+    let declaration =
+        "amends \"pkl:Project\"\ndependencies { [\"lib\"] = import(\"library/PklProject\") }";
+    std::fs::write(&project, declaration).unwrap();
+    let uri = url::Url::from_file_path(root.join("editing.pkl")).unwrap();
+    let mut client = ProjectClient::new(&root);
+    client.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri.as_str(),"version":1,"text":"amends \"@lib/Schema.pkl\"\nfea"}}}));
+    let sync = json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"});
+    let completion = json!({"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":uri.as_str()},"position":{"line":1,"character":3}}});
+    assert_eq!(client.request(sync.clone())["result"], Value::Null);
+    assert_eq!(
+        client.request(completion.clone())["result"][0]["label"],
+        "featureFlag"
+    );
+    std::fs::write(
+        &project,
+        "amends \"pkl:Project\"\ndependencies = read(\"env:NOT_READ\")",
+    )
+    .unwrap();
+    assert_eq!(client.request(sync.clone())["error"]["code"], -32000);
+    assert_eq!(client.request(completion.clone())["result"], json!([]));
+    std::fs::write(&project, declaration).unwrap();
+    client.request(sync.clone());
+    assert_eq!(
+        client.request(completion.clone())["result"][0]["label"],
+        "featureFlag"
+    );
+    std::fs::write(&project, "amends \"pkl:Project\"").unwrap();
+    client.request(sync);
+    assert_eq!(client.request(completion)["result"], json!([]));
+}
+
+#[test]
+fn project_sync_rejects_oversized_sources_and_lockfiles() {
+    let root = synthetic_project_root("bounds");
+    let project = root.join("PklProject");
+    std::fs::write(&project, " ".repeat(1024 * 1024 + 1)).unwrap();
+    let mut client = ProjectClient::new(&root);
+    let sync = json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"});
+    assert_eq!(client.request(sync.clone())["error"]["code"], -32000);
+    std::fs::write(&project, "amends \"pkl:Project\"").unwrap();
+    std::fs::write(root.join("PklProject.deps.json"), "{\"schemaVersion\":1}").unwrap();
+    assert_eq!(client.request(sync)["error"]["code"], -32000);
+}
+
+#[test]
+fn local_dependency_open_documents_override_disk_and_nested_projects_are_boundaries() {
+    let root = project_initialize("app");
+    let directory = root["params"]["workspaceFolders"][0]["uri"]
+        .as_str()
+        .unwrap();
+    let uri = format!("{directory}editing.pkl");
+    let nested_uri = format!("{directory}nested/editing.pkl");
+    let dependency = url::Url::from_file_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/projects/library/Schema.pkl"),
+    )
+    .unwrap();
+    let result = exchange(&[
+        root.clone(),
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":dependency.as_str(),"version":1,"text":"featureFromBuffer: String"}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"version":1,"text":"import \"@library/Schema.pkl\" as Lib\nvalue = Lib.fea"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":15}}}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":nested_uri,"version":1,"text":"amends \"@library/Schema.pkl\"\nfea"}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{"textDocument":{"uri":nested_uri},"position":{"line":1,"character":3}}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[2]["result"][0]["label"], "featureFromBuffer");
+    assert_eq!(result[2]["result"].as_array().unwrap().len(), 1);
+    assert_eq!(result[3]["result"], json!([]));
+}
+
+#[test]
+fn local_project_subset_rejects_expressions_duplicates_and_missing_dependencies() {
+    let root = synthetic_project_root("unsupported");
+    let mut client = ProjectClient::new(&root);
+    for source in [
+        "amends \"other.pkl\"",
+        "amends \"pkl:Project\"\ndependencies { [\"lib\"] = import(\"missing/PklProject\") }",
+        "amends \"pkl:Project\"\ndependencies { [\"lib\"] = import(\"x/PklProject\"); [\"lib\"] = import(\"y/PklProject\") }",
+        "amends \"pkl:Project\"\ndependencies { [\"lib\"] = import(\"https://example.invalid/PklProject\") }",
+        "amends \"pkl:Project\"\ndependencies { [\"lib\"] = import(\"x/\\(read(\"env:NOT_READ\"))/PklProject\") }",
+        "amends \"pkl:Project\"\nevaluatorSettings { modulePath { \"lib\" } }",
+    ] {
+        std::fs::write(root.join("PklProject"), source).unwrap();
+        assert_eq!(
+            client.request(json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}))["error"]["code"],
+            -32000,
+            "{source}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dependency_symlinks_cannot_escape_and_module_reads_are_size_bounded() {
+    let root = synthetic_project_root("escape");
+    let library = root.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(library.join("PklProject"), "amends \"pkl:Project\"").unwrap();
+    std::fs::write(
+        root.join("PklProject"),
+        "amends \"pkl:Project\"\ndependencies { [\"lib\"] = import(\"library/PklProject\") }",
+    )
+    .unwrap();
+    std::fs::write(root.join("outside.pkl"), "featureEscaped: Boolean").unwrap();
+    std::os::unix::fs::symlink(root.join("outside.pkl"), library.join("escape.pkl")).unwrap();
+    std::fs::write(
+        library.join("huge.pkl"),
+        format!("featureHuge: Boolean\n{}", " ".repeat(8 * 1024 * 1024)),
+    )
+    .unwrap();
+    let uri = url::Url::from_file_path(root.join("editing.pkl")).unwrap();
+    let mut client = ProjectClient::new(&root);
+    client.request(json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}));
+    for member in ["escape.pkl", "huge.pkl"] {
+        client.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri.as_str(),"version":1,"text":format!("amends \"@lib/{member}\"\nfea")}}}));
+        assert_eq!(client.request(json!({"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":uri.as_str()},"position":{"line":1,"character":3}}}))["result"], json!([]));
+    }
+    // Inside-directory symlinks keep their resolved protocol URI for buffer lookup.
+    std::fs::write(library.join("real.pkl"), "featureDisk: Boolean").unwrap();
+    std::os::unix::fs::symlink(library.join("real.pkl"), library.join("inside.pkl")).unwrap();
+    let inside = url::Url::from_file_path(library.join("inside.pkl")).unwrap();
+    client.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":inside.as_str(),"version":1,"text":"featureBuffer: String"}}}));
+    client.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri.as_str(),"version":1,"text":"amends \"@lib/inside.pkl\"\nfea"}}}));
+    assert_eq!(client.request(json!({"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":uri.as_str()},"position":{"line":1,"character":3}}}))["result"][0]["label"], "featureBuffer");
+    client.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":inside.as_str(),"version":2},"contentChanges":[{"text":format!("featureTooBig: Boolean\n{}", " ".repeat(8 * 1024 * 1024))}]}}));
+    assert_eq!(client.request(json!({"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":uri.as_str()},"position":{"line":1,"character":3}}}))["result"], json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_sync_rejects_fifo_without_blocking_stdio() {
+    let root = synthetic_project_root("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(root.join("PklProject"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut client = ProjectClient::new(&root);
+    assert_eq!(
+        client.request(json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}))["error"]["code"],
+        -32000
+    );
+}
+
+#[test]
+fn project_sync_enforces_workspace_and_alias_count_limits() {
+    let root = synthetic_project_root("counts");
+    let library = root.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(library.join("PklProject"), "amends \"pkl:Project\"").unwrap();
+    let mut client = ProjectClient::new(&root);
+    let sync = json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"});
+    for (count, expected_error) in [(64, false), (65, true)] {
+        let entries: String = (0..count)
+            .map(|index| format!("[\"lib{index}\"] = import(\"library/PklProject\")\n"))
+            .collect();
+        std::fs::write(
+            root.join("PklProject"),
+            format!("amends \"pkl:Project\"\ndependencies {{\n{entries}}}"),
+        )
+        .unwrap();
+        let response = client.request(sync.clone());
+        assert_eq!(response.get("error").is_some(), expected_error);
+    }
+    let uri = url::Url::from_directory_path(&root).unwrap();
+    let folder = json!({"uri":uri.as_str(),"name":"synthetic"});
+    let result = exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspaceFolders":vec![folder; 33]}}),
+        sync,
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    assert_eq!(result[1]["error"]["code"], -32000);
+}
+
+#[test]
+fn sync_and_dependency_buffer_changes_republish_amended_diagnostics() {
+    let root = project_initialize("app");
+    let uri = format!(
+        "{}editing.pkl",
+        root["params"]["workspaceFolders"][0]["uri"]
+            .as_str()
+            .unwrap()
+    );
+    let dependency = url::Url::from_file_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/projects/library/Schema.pkl"),
+    )
+    .unwrap();
+    let result = exchange_all(&[
+        root,
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"version":1,"text":"amends \"@library/Schema.pkl\"\nfeatureFlag = 42"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"pkl/syncProjects"}),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":dependency.as_str(),"version":1,"text":"featureFlag: Int"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    let child: Vec<_> = result
+        .iter()
+        .filter(|message| {
+            message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["uri"] == uri
+        })
+        .collect();
+    assert_eq!(child.len(), 3);
+    assert_eq!(child[0]["params"]["diagnostics"], json!([]));
+    assert_eq!(
+        child[1]["params"]["diagnostics"][0]["code"],
+        "type-mismatch"
+    );
+    assert_eq!(child[2]["params"]["diagnostics"], json!([]));
+}
+
 #[test]
 fn protocol_initialization_and_shutdown() {
     let result = exchange(&[

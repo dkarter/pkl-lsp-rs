@@ -485,6 +485,103 @@ pub fn amends_uri(source: &str) -> Option<&str> {
     text.strip_prefix('"')?.strip_suffix('"')
 }
 
+/// A deliberately non-evaluating subset of PklProject, never an approximation
+/// of arbitrary Pkl expressions. Reject rather than silently omit declarations.
+pub fn local_project_dependencies(source: &str) -> Option<HashMap<String, String>> {
+    let tree = tree(source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let header = direct(root, "moduleHeader")?;
+    let clause = direct(header, "extendsOrAmendsClause")?;
+    if !clause
+        .utf8_text(source.as_bytes())
+        .ok()?
+        .starts_with("amends")
+        || direct(clause, "stringConstant")?
+            .utf8_text(source.as_bytes())
+            .ok()?
+            != "\"pkl:Project\""
+    {
+        return None;
+    }
+    fn children(node: Node<'_>) -> Vec<Node<'_>> {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .filter(|child| !matches!(child.kind(), "lineComment" | "blockComment" | "docComment"))
+            .collect()
+    }
+    fn literal<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+        let text = node.utf8_text(source.as_bytes()).ok()?;
+        let value = text.strip_prefix('"')?.strip_suffix('"')?;
+        (!value.contains(['"', '\\', '\n', '\r'])).then_some(value)
+    }
+    let mut dependencies = HashMap::new();
+    let mut seen = false;
+    for node in children(root) {
+        if node.kind() == "moduleHeader" {
+            // No module annotations, modifiers or custom inherited project.
+            if children(node).len() != 1 {
+                return None;
+            }
+            continue;
+        }
+        let parts = children(node);
+        if node.kind() != "classProperty" || parts.len() != 2 || seen {
+            return None;
+        }
+        if parts[0].kind() != "identifier"
+            || parts[0].utf8_text(source.as_bytes()).ok()? != "dependencies"
+            || parts[1].kind() != "objectBody"
+        {
+            return None;
+        }
+        seen = true;
+        for entry in children(parts[1]) {
+            let parts = children(entry);
+            if entry.kind() != "objectEntry"
+                || parts.len() != 2
+                || parts[0].kind() != "slStringLiteralExpr"
+                || parts[1].kind() != "importExpr"
+            {
+                return None;
+            }
+            let alias = literal(parts[0], source)?;
+            if alias.is_empty()
+                || !alias
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                return None;
+            }
+            let import = children(parts[1]);
+            if import.len() != 1 || import[0].kind() != "stringConstant" {
+                return None;
+            }
+            let path = literal(import[0], source)?;
+            if dependencies.len() >= 64
+                || dependencies
+                    .insert(alias.to_owned(), path.to_owned())
+                    .is_some()
+            {
+                return None;
+            }
+        }
+    }
+    Some(dependencies)
+}
+
+pub fn safe_member(member: &str) -> bool {
+    !member.is_empty()
+        && member.len() <= 4096
+        && member
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && !member.contains(['\\', '%', '?', '#', ':'])
+        && !member.chars().any(char::is_control)
+}
+
 pub fn object_context(source: &str, line: usize, column: usize) -> Option<String> {
     let prefix = source
         .lines()
@@ -531,24 +628,32 @@ pub fn object_context(source: &str, line: usize, column: usize) -> Option<String
 
 pub fn package_module(uri: &str) -> Option<String> {
     let (package, member) = uri.strip_prefix("package://")?.split_once("#/")?;
+    if !safe_member(member) {
+        return None;
+    }
     let archive = package_archive(&format!("package://{package}"))?;
     package_member(&archive, member)
 }
 
 pub fn package_member(bytes: &[u8], member: &str) -> Option<String> {
-    if member.is_empty() || member.starts_with('/') || member.split('/').any(|part| part == "..") {
+    if !safe_member(member) {
         return None;
     }
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
     let file = archive.by_name(member).ok()?;
+    read_text(file, MAX_MODULE_BYTES)
+}
+
+pub fn read_text(reader: impl Read, limit: u64) -> Option<String> {
     let mut source = String::new();
-    file.take(MAX_MODULE_BYTES + 1)
-        .read_to_string(&mut source)
-        .ok()?;
-    (source.len() as u64 <= MAX_MODULE_BYTES).then_some(source)
+    reader.take(limit + 1).read_to_string(&mut source).ok()?;
+    (source.len() as u64 <= limit).then_some(source)
 }
 
 pub fn package_archive(uri: &str) -> Option<Vec<u8>> {
+    if uri.len() > 8192 || uri.chars().any(char::is_control) {
+        return None;
+    }
     let package = uri.strip_prefix("package://")?;
     if package.contains('#') {
         return None;

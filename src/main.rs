@@ -1,4 +1,5 @@
 mod formatter;
+mod projects;
 mod schema;
 mod server;
 

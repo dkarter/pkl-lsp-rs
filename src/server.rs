@@ -1,7 +1,7 @@
-use crate::schema;
+use crate::{projects, schema};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -12,6 +12,7 @@ struct Server {
     archives: HashMap<String, Vec<u8>>,
     outbound: Vec<Value>,
     shutdown: bool,
+    projects: projects::Projects,
 }
 
 pub fn run(mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
@@ -101,7 +102,9 @@ impl Server {
         }
         let params = &message["params"];
         let result = match method {
-            "initialize" => json!({"capabilities": {
+            "initialize" => {
+                self.projects.initialize(params);
+                json!({"capabilities": {
                 "textDocumentSync": 1,
                 "completionProvider": {"resolveProvider": true, "triggerCharacters": [".", "/", "\"", ":"]},
                 "hoverProvider": true,
@@ -109,7 +112,32 @@ impl Server {
                 "codeActionProvider": {"codeActionKinds":["quickfix"]},
                 "documentFormattingProvider": true,
                 "semanticTokensProvider": {"legend":{"tokenTypes":["property"],"tokenModifiers":["documentation"]},"full":true,"range":false}
-            }, "serverInfo": {"name": "pkl-lsp-rs", "version": env!("CARGO_PKG_VERSION")}}),
+            }, "serverInfo": {"name": "pkl-lsp-rs", "version": env!("CARGO_PKG_VERSION")}})
+            }
+            "pkl/syncProjects" => {
+                let result = self.projects.sync();
+                let dependents: Vec<_> = self
+                    .documents
+                    .iter()
+                    .filter(|(_, text)| {
+                        schema::amends_uri(text).is_some_and(|amended| amended.starts_with('@'))
+                    })
+                    .map(|(uri, _)| uri.clone())
+                    .collect();
+                for uri in dependents {
+                    if let Some(text) = self.documents.get(&uri).cloned() {
+                        self.publish_diagnostics(
+                            &uri,
+                            &text,
+                            self.document_versions.get(&uri).copied(),
+                        );
+                    }
+                }
+                if let Err(reason) = result {
+                    return message.get("id").map(|id| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":reason}}));
+                }
+                Value::Null
+            }
             "shutdown" => {
                 self.shutdown = true;
                 Value::Null
@@ -346,20 +374,25 @@ impl Server {
 
 impl Server {
     fn local_import_schema(&self, uri: &str, import: &str) -> Option<(String, schema::Schema)> {
-        let target = url::Url::parse(uri).ok()?.join(import).ok()?;
-        if target.scheme() != "file" {
-            return None;
-        }
-        let source = self.documents.get(target.as_str()).cloned().or_else(|| {
-            let mut source = String::new();
-            std::fs::File::open(target.to_file_path().ok()?)
-                .ok()?
-                .take(schema::MAX_MODULE_BYTES + 1)
-                .read_to_string(&mut source)
-                .ok()?;
-            (source.len() as u64 <= schema::MAX_MODULE_BYTES).then_some(source)
-        })?;
+        let target = self.local_target(uri, import)?;
+        let source = if let Some(text) = self.documents.get(target.as_str()) {
+            if text.len() as u64 > schema::MAX_MODULE_BYTES {
+                return None;
+            }
+            text.clone()
+        } else {
+            projects::read_bounded(&target.to_file_path().ok()?, schema::MAX_MODULE_BYTES)?
+        };
         Some((target.into(), schema::parse(&source)?))
+    }
+
+    fn local_target(&self, uri: &str, import: &str) -> Option<url::Url> {
+        if import.starts_with('@') {
+            self.projects.resolve(uri, import)
+        } else {
+            let target = url::Url::parse(uri).ok()?.join(import).ok()?;
+            (target.scheme() == "file").then_some(target)
+        }
     }
 
     fn republish_dependents(&mut self, changed: &str) {
@@ -368,7 +401,7 @@ impl Server {
             .iter()
             .filter_map(|(uri, text)| {
                 let amended = schema::amends_uri(text)?;
-                let target = url::Url::parse(uri).ok()?.join(amended).ok()?;
+                let target = self.local_target(uri, amended)?;
                 (uri != changed && target.as_str() == changed).then(|| {
                     (
                         uri.clone(),
@@ -420,22 +453,7 @@ impl Server {
             };
             (amended.to_owned(), text)
         } else {
-            let base = url::Url::parse(uri).ok()?;
-            let target = base.join(amended).ok()?;
-            if target.scheme() != "file" {
-                return None;
-            }
-            let text = self.documents.get(target.as_str()).cloned().or_else(|| {
-                let path = target.to_file_path().ok()?;
-                let mut text = String::new();
-                std::fs::File::open(path)
-                    .ok()?
-                    .take(schema::MAX_MODULE_BYTES + 1)
-                    .read_to_string(&mut text)
-                    .ok()?;
-                (text.len() as u64 <= schema::MAX_MODULE_BYTES).then_some(text)
-            })?;
-            (target.to_string(), text)
+            return self.local_import_schema(uri, amended);
         };
         Some((target, schema::parse(&inherited)?))
     }

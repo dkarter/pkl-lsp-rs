@@ -1,0 +1,3 @@
+module Schema
+/// A synthetic local dependency property.
+featureFlag: Boolean
