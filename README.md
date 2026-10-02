@@ -33,8 +33,14 @@ resolve imports, dependencies, inherited class hierarchies, or arbitrary Pkl
 expressions. GitHub package ZIPs are size-limited and SHA-256 checked against
 the package's public metadata. This is not a full Pkl package trust or
 dependency-resolution implementation; do not open untrusted packages yet.
-Formatting currently handles only spacing around simple top-level assignments
-and the final newline. Type checking handles only direct primitive literals
+Formatting supports assignment spacing in nested class/object properties and
+entries, property amendment-body spacing, class/object indentation (LSP spaces
+or tabs), and a missing final newline. It preserves comment/string tokens and
+line endings, and rejects edits that change the syntax tree or token contents.
+It returns **no edits** for multiline strings, unsupported multiline expression
+layouts, invalid syntax/options, or documents exceeding its size/depth limits.
+It does not wrap lines, reflow comments, normalize general expression/type
+spacing, or implement the full upstream formatter. Type checking handles only direct primitive literals
 with explicit or directly amended property types. Downloads remain in memory
 for the lifetime of the server process.
 

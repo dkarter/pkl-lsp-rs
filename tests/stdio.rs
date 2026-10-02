@@ -221,7 +221,10 @@ fn formatting_normalizes_property_assignment_without_changing_string_contents() 
         true
     );
     let edits = result[1]["result"].as_array().unwrap();
-    assert!(edits.iter().any(|edit| edit["newText"] == " = "));
+    assert_eq!(
+        apply_format_edits("answer=42\nmessage=\"a=b\"", edits),
+        "answer = 42\nmessage = \"a=b\"\n"
+    );
     assert!(edits.iter().any(|edit| edit["newText"] == "\n"));
     assert!(
         !edits
@@ -229,6 +232,175 @@ fn formatting_normalizes_property_assignment_without_changing_string_contents() 
             .any(|edit| edit["newText"].as_str().unwrap().contains("a = b"))
     );
     assert_eq!(result[2]["result"], json!([]));
+}
+
+fn formatting(source: &str, options: Value) -> Vec<Value> {
+    let responses = exchange_all(&[
+        initialize(),
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/formatter.pkl","languageId":"pkl","version":1,"text":source}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///tmp/formatter.pkl"},"options":options}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+        json!({"jsonrpc":"2.0","method":"exit"}),
+    ]);
+    if !source.ends_with("= (") {
+        let diagnostics = &responses
+            .iter()
+            .find(|m| m["method"] == "textDocument/publishDiagnostics")
+            .unwrap()["params"]["diagnostics"];
+        assert!(
+            !diagnostics
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "syntax"),
+            "{diagnostics}"
+        );
+    }
+    responses.iter().find(|m| m["id"] == 2).unwrap()["result"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn apply_format_edits(source: &str, edits: &[Value]) -> String {
+    let offset = |position: &Value| {
+        let row = position["line"].as_u64().unwrap() as usize;
+        let col = position["character"].as_u64().unwrap() as usize;
+        let start: usize = source.split_inclusive('\n').take(row).map(str::len).sum();
+        let mut units = 0;
+        let mut byte = start;
+        for ch in source[start..].chars() {
+            if units == col {
+                break;
+            }
+            units += ch.len_utf16();
+            byte += ch.len_utf8();
+        }
+        assert_eq!(units, col);
+        byte
+    };
+    let mut edits: Vec<_> = edits
+        .iter()
+        .map(|edit| {
+            (
+                offset(&edit["range"]["start"]),
+                offset(&edit["range"]["end"]),
+                edit["newText"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    edits.sort_by_key(|edit| edit.0);
+    for pair in edits.windows(2) {
+        assert!(pair[0].1 <= pair[1].0, "overlapping edits");
+    }
+    let mut result = source.to_owned();
+    for (start, end, text) in edits.into_iter().rev() {
+        result.replace_range(start..end, text);
+    }
+    result
+}
+
+fn assert_formatted(source: &str, expected: &str, options: Value) {
+    let edits = formatting(source, options.clone());
+    assert_eq!(apply_format_edits(source, &edits), expected);
+    assert_eq!(
+        formatting(expected, options),
+        Vec::<Value>::new(),
+        "formatting must be idempotent"
+    );
+}
+
+#[test]
+fn formatting_nested_classes_objects_entries_and_comments_is_idempotent() {
+    let source = "class Config {\nname: String=\"a=b\"\nchild {\n// keep = { }\nvalue=1 // trailing = comment\n}\n}\nconfig = new Config {\nname=\"ok\"\nchild {\n[\"key\"]=2\n}\n}";
+    let expected = "class Config {\n  name: String = \"a=b\"\n  child {\n    // keep = { }\n    value = 1 // trailing = comment\n  }\n}\nconfig = new Config {\n  name = \"ok\"\n  child {\n    [\"key\"] = 2\n  }\n}\n";
+    assert_formatted(source, expected, json!({"tabSize":2,"insertSpaces":true}));
+}
+
+#[test]
+fn formatting_preserves_raw_escaped_interpolated_strings_and_comment_tokens() {
+    let source = "/// Keep [name] = 😀\nobj {\ntext= #\"raw = { \\\" }\"#\nother=\"escaped \\\" = \\(1 + 2)\"\n/* keep = {\n  interior unchanged\n} */\nvalue /* left */ = /* right */ 3\n}";
+    let expected = "/// Keep [name] = 😀\nobj {\n  text = #\"raw = { \\\" }\"#\n  other = \"escaped \\\" = \\(1 + 2)\"\n  /* keep = {\n  interior unchanged\n} */\n  value /* left */ = /* right */ 3\n}\n";
+    assert_formatted(source, expected, json!({"tabSize":2,"insertSpaces":true}));
+}
+
+#[test]
+fn formatting_honors_indentation_options_and_crlf() {
+    assert_formatted(
+        "obj {\r\n  nested {\r\nvalue=1\r\n  }\r\n}",
+        "obj {\r\n\tnested {\r\n\t\tvalue = 1\r\n\t}\r\n}\r\n",
+        json!({"tabSize":4,"insertSpaces":false}),
+    );
+    assert_formatted(
+        "obj {\n value=1\n}",
+        "obj {\n    value = 1\n}\n",
+        json!({"tabSize":4,"insertSpaces":true}),
+    );
+}
+
+#[test]
+fn formatting_uses_utf16_edit_ranges() {
+    assert_formatted(
+        "`😀`=\"😀=x\"",
+        "`😀` = \"😀=x\"\n",
+        json!({"tabSize":2,"insertSpaces":true}),
+    );
+}
+
+#[test]
+fn formatting_many_sibling_bodies_preserves_inline_expression_layout() {
+    let source = (0..256)
+        .map(|index| format!("obj{index} {{\nvalue=List(1, 2); other = (1 + 2)\n}}\n"))
+        .collect::<String>();
+    let expected = (0..256)
+        .map(|index| format!("obj{index} {{\n  value = List(1, 2); other = (1 + 2)\n}}\n"))
+        .collect::<String>();
+    assert_formatted(&source, &expected, json!({"tabSize":2,"insertSpaces":true}));
+}
+
+#[test]
+fn formatting_declines_excessive_input_work_and_output_expansion() {
+    let too_large = format!("//{}", "x".repeat(1024 * 1024));
+    let too_wide = format!("//{}", "x".repeat(16_384));
+    let too_many = (0..6000)
+        .map(|index| format!("value{index}=1\n"))
+        .collect::<String>();
+    let too_deep = format!("{}value=1\n{}", "obj {\n".repeat(140), "}\n".repeat(140));
+    let too_expanded = format!(
+        "{}{}{}",
+        "obj {\n".repeat(40),
+        (0..1700)
+            .map(|index| format!("value{index}=1\n"))
+            .collect::<String>(),
+        "}\n".repeat(40)
+    );
+    for source in [too_large, too_wide, too_many, too_deep, too_expanded] {
+        assert!(formatting(&source, json!({"tabSize":16,"insertSpaces":true})).is_empty());
+    }
+}
+
+#[test]
+fn formatting_declines_multiline_strings_continuations_and_invalid_input() {
+    for source in [
+        "obj {\ntext=\"\"\"\n  keep = spaces\n  \"\"\"\n}",
+        "text=#\"\"\"\n  raw = spaces\n  \"\"\"#",
+        "value=List(\n1,\n2\n)",
+        "obj {\nfor (x in List(1)) {\nvalue=x\n}\n}",
+        "obj {\nwhen (true) {\nvalue=1\n}\n}",
+        "value = (",
+    ] {
+        assert!(
+            formatting(source, json!({"tabSize":2,"insertSpaces":true})).is_empty(),
+            "unsafe edits for {source}"
+        );
+    }
+    for options in [
+        json!({"tabSize":0,"insertSpaces":true}),
+        json!({"tabSize":1000000,"insertSpaces":true}),
+        json!({}),
+    ] {
+        assert!(formatting("obj {\nvalue=1\n}", options).is_empty());
+    }
 }
 
 #[test]

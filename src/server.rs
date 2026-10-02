@@ -329,11 +329,9 @@ impl Server {
             }
             "textDocument/formatting" => {
                 let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
-                json!(
-                    self.documents
-                        .get(uri)
-                        .map_or_else(Vec::new, |text| schema::format_edits(text))
-                )
+                json!(self.documents.get(uri).map_or_else(Vec::new, |text| {
+                    crate::formatter::format_edits(text, &params["options"])
+                }))
             }
             "initialized" | "textDocument/didSave" | "$/cancelRequest" => return None,
             _ => {

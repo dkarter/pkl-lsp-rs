@@ -235,55 +235,6 @@ fn unused_imports_tree(root: Node<'_>, source: &str) -> Vec<UnusedImport> {
     unused
 }
 
-pub fn format_edits(source: &str) -> Vec<serde_json::Value> {
-    let Some(tree) = tree(source) else {
-        return Vec::new();
-    };
-    if tree.root_node().has_error() {
-        return Vec::new();
-    }
-    let mut edits = Vec::new();
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    for property in root
-        .named_children(&mut cursor)
-        .filter(|node| node.kind() == "classProperty")
-    {
-        let Some(identifier) = direct(property, "identifier") else {
-            continue;
-        };
-        let mut children = property.walk();
-        let value = property.named_children(&mut children).last();
-        let Some(value) = value.filter(|value| {
-            value.start_byte() > identifier.end_byte() && value.kind() != "typeAnnotation"
-        }) else {
-            continue;
-        };
-        let Some(gap) = source.get(identifier.end_byte()..value.start_byte()) else {
-            continue;
-        };
-        if gap.trim() != "=" || gap == " = " {
-            continue;
-        }
-        let position = |byte: usize| {
-            let before = &source[..byte];
-            serde_json::json!({"line":before.bytes().filter(|byte| *byte == b'\n').count(),"character":before.rsplit('\n').next().unwrap_or("").encode_utf16().count()})
-        };
-        edits.push(serde_json::json!({"range":{"start":position(identifier.end_byte()),"end":position(value.start_byte())},"newText":" = "}));
-    }
-    if !source.is_empty() && !source.ends_with('\n') {
-        let row = source.bytes().filter(|byte| *byte == b'\n').count();
-        let col = source
-            .rsplit('\n')
-            .next()
-            .unwrap_or("")
-            .encode_utf16()
-            .count();
-        edits.push(serde_json::json!({"range":{"start":{"line":row,"character":col},"end":{"line":row,"character":col}},"newText":"\n"}));
-    }
-    edits
-}
-
 pub fn documentation_tokens(source: &str) -> Vec<usize> {
     let Some(tree) = tree(source) else {
         return Vec::new();
