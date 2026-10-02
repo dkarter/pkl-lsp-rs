@@ -55,7 +55,19 @@ The current prefix matcher is intentionally temporary; the parser extracts
 top-level and direct class declarations, but it does not infer types, inspect
 imported modules, or traverse inherited class hierarchies. Cursor prefixes
 use UTF-16 offsets, but every Unicode edge case has not been tested. Remote
-package retrieval currently blocks the protocol loop; SHA-256 is checked
+package retrieval now uses bounded background workers; only the requesting
+package-dependent response waits for verification, not the protocol loop.
+The offline process tests `slow_schema_fetch_does_not_block_documents_requests_or_shutdown`
+and `unavailable_download_does_not_block_documents_requests_or_shutdown`
+hold a local fixture's metadata response while proving document change/close,
+unrelated requests, shutdown and exit remain responsive.
+`verified_download_is_deduplicated_and_cached_for_completion_and_contents`,
+`checksum_failure_is_not_cached_as_verified_or_retried_immediately`, and
+`cancelled_completion_does_not_block_or_publish_a_late_response` cover verified
+cache reuse, negative caching and request cancellation. The two public hk
+stdio tests also pass with deferred responses. The coordinator must rerun the
+Neovim/Blink E2E after merge; the earlier E2E evidence above is not evidence for
+this change. SHA-256 is checked
 against public metadata but is not a complete trust policy.
 No parity claim should be inferred from release workflow configuration.
 
@@ -85,3 +97,11 @@ levels, and 16,384 visited nodes/edits. The process tests
 `formatting_declines_excessive_input_work_and_output_expansion` cover repeated
 bodies and safe refusal at these bounds. Formatting remains synchronous;
 there is no parser deadline or cancellation support.
+
+Observed on 2026-10-02 after rebasing the asynchronous package change onto
+the nested formatter and local project sync: 54 offline stdio
+tests pass, alongside size-limit and unsupported-host unit tests. Both ignored
+public hk network stdio tests pass when run explicitly. Queue/worker limit,
+EOF cancellation and current-document replay tests supplement the cases above.
+Package inheritance, persistence, general registries and a complete trust policy
+remain missing; local file reads and parsing are still synchronous.

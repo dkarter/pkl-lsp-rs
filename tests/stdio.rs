@@ -2,6 +2,9 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[path = "support/protocol.rs"]
+mod protocol;
+
 fn exchange(messages: &[Value]) -> Vec<Value> {
     exchange_all(messages)
         .into_iter()
@@ -51,6 +54,40 @@ fn exchange_all(messages: &[Value]) -> Vec<Value> {
         responses.push(serde_json::from_slice(&cursor[..length]).unwrap());
         cursor = &cursor[length..];
     }
+    responses
+}
+
+// Package-dependent responses are deferred. Keep stdin open and await each
+// request before sending a dependent request or shutdown (as a real client does).
+fn exchange_network(messages: &[Value]) -> Vec<Value> {
+    use std::io::BufReader;
+    let mut process = Command::new(env!("CARGO_BIN_EXE_pkl-lsp-rs"))
+        .env("PATH", "/nonexistent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = process.stdin.take().unwrap();
+    let mut output = BufReader::new(process.stdout.take().unwrap());
+    let mut responses = Vec::new();
+    for message in messages {
+        protocol::send(&mut input, message);
+        if let Some(id) = message.get("id") {
+            loop {
+                let response =
+                    protocol::receive(&mut output).expect("server closed before response");
+                if response.get("id").is_some() {
+                    let matched = &response["id"] == id;
+                    responses.push(response);
+                    if matched {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop(input);
+    assert!(process.wait().unwrap().success());
     responses
 }
 
@@ -1088,7 +1125,7 @@ fn invalid_package_request_is_not_silently_successful() {
 #[test]
 #[ignore = "requires public GitHub release network access"]
 fn package_download_request_makes_public_module_available() {
-    let result = exchange(&[
+    let result = exchange_network(&[
         initialize(),
         json!({"jsonrpc":"2.0","id":2,"method":"pkl/downloadPackage","params":"package://github.com/jdx/hk/releases/download/v2.0.1/hk@2.0.1"}),
         json!({"jsonrpc":"2.0","id":3,"method":"pkl/fileContents","params":{"uri":"package://github.com/jdx/hk/releases/download/v2.0.1/hk@2.0.1#/Config.pkl"}}),
@@ -1196,7 +1233,7 @@ fn commented_amends_does_not_load_a_schema() {
 #[test]
 #[ignore = "requires public GitHub release network access"]
 fn public_hk_package_schema_completes_from_release() {
-    let result = exchange(&[
+    let result = exchange_network(&[
         initialize(),
         json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/hk-public.pkl","languageId":"pkl","version":1,"text":"amends \"package://github.com/jdx/hk/releases/download/v2.0.1/hk@2.0.1#/Config.pkl\"\nmin_hk_v"}}}),
         json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/hk-public.pkl"},"position":{"line":1,"character":8}}}),

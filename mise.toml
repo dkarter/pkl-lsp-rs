@@ -24,7 +24,7 @@ run = "cargo fmt --all -- --check && dprint check"
 
 [tasks.test]
 description = "Run Rust tests including real stdio protocol tests"
-run = "mbx test --locked --all-targets"
+run = "mbx test --locked --all-targets --features test-fixture"
 
 [tasks.test-e2e]
 description = "Use isolated Neovim and Blink against the public hk package (network required)"
@@ -32,7 +32,7 @@ run = "bash tests/run-neovim-blink.sh"
 
 [tasks.lint]
 description = "Lint Rust code"
-run = "mbx clippy --locked --all-targets -- -D warnings"
+run = "mbx clippy --locked --all-targets --features test-fixture -- -D warnings"
 
 [tasks.workflow-check]
 description = "Validate GitHub workflows"

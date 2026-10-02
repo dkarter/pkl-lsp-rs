@@ -86,6 +86,31 @@ member symlinks must stay inside the dependency directory. Package download URIs
 are limited to 8192 bytes; ZIP downloads remain limited to 8 MiB. These checks are
 not a filesystem sandbox against concurrent hostile changes.
 
+### Asynchronous public package downloads
+
+Public package I/O runs on background workers, not the stdio protocol loop.
+An uncached package-dependent completion, hover, definition, or
+`pkl/downloadPackage` request waits for verification; unrelated requests and
+document notifications continue normally. Responses use the current open
+document when the download finishes, and cancellation/shutdown cancels pending
+responses without waiting for network I/O. No new client capability or custom
+retry notification is required for public hk completion.
+Clean stdin EOF also cancels outstanding requests rather than silently dropping
+them. Cancellation responses use JSON-RPC error code `-32800`.
+Downloads for the same package share one worker. At most four packages and
+128 waiting requests are admitted (each limited to 64 KiB); excess requests
+receive an error and may be retried. Failed downloads are cached for 30 seconds,
+then retried on demand; the 16-entry failure cache evicts its oldest entry.
+Verified archives and member sources retain the bounded in-memory cache (16
+entries per cache, cleared at capacity); nothing is persisted to disk.
+The production transport still accepts only public GitHub release URLs and
+uses the same metadata URL matching, SHA-256 verification, and size limits.
+
+`mise run test` also builds a separate, opt-in `test-fixture` executable. Its
+local transport exercises the same protocol and verification code with
+deterministic stalls and synthetic public-package metadata. It is not a
+configuration option or trust bypass in the shipped `pkl-lsp-rs` binary.
+
 ## Release preparation (not activated)
 
 The release-please configuration consumes **atomic conventional commits**.

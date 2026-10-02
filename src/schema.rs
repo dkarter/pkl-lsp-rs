@@ -626,15 +626,6 @@ pub fn object_context(source: &str, line: usize, column: usize) -> Option<String
     stack.last().cloned().filter(|name| !name.is_empty())
 }
 
-pub fn package_module(uri: &str) -> Option<String> {
-    let (package, member) = uri.strip_prefix("package://")?.split_once("#/")?;
-    if !safe_member(member) {
-        return None;
-    }
-    let archive = package_archive(&format!("package://{package}"))?;
-    package_member(&archive, member)
-}
-
 pub fn package_member(bytes: &[u8], member: &str) -> Option<String> {
     if !safe_member(member) {
         return None;
@@ -651,6 +642,17 @@ pub fn read_text(reader: impl Read, limit: u64) -> Option<String> {
 }
 
 pub fn package_archive(uri: &str) -> Option<Vec<u8>> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .new_agent();
+    package_archive_with_fetch(uri, |url, limit| fetch(&agent, url, limit))
+}
+
+pub fn package_archive_with_fetch(
+    uri: &str,
+    fetch: impl Fn(&str, u64) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
     if uri.len() > 8192 || uri.chars().any(char::is_control) {
         return None;
     }
@@ -669,18 +671,18 @@ pub fn package_archive(uri: &str) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(15)))
-        .build()
-        .new_agent();
-    let metadata = fetch(&agent, metadata_url.as_str(), 1024 * 1024)?;
+    let metadata = fetch(metadata_url.as_str(), 1024 * 1024)?;
+    if metadata.len() > 1024 * 1024 {
+        return None;
+    }
     let metadata: serde_json::Value = serde_json::from_slice(&metadata).ok()?;
     if metadata["packageZipUrl"].as_str()? != url.as_str() {
         return None;
     }
     let checksum = metadata["packageZipChecksums"]["sha256"].as_str()?;
-    let bytes = fetch(&agent, url.as_str(), MAX_MODULE_BYTES)?;
-    if checksum.len() != 64
+    let bytes = fetch(url.as_str(), MAX_MODULE_BYTES)?;
+    if bytes.len() as u64 > MAX_MODULE_BYTES
+        || checksum.len() != 64
         || format!("{:x}", Sha256::digest(&bytes)) != checksum.to_ascii_lowercase()
     {
         return None;
@@ -698,4 +700,73 @@ fn fetch(agent: &ureq::Agent, url: &str, limit: u64) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PACKAGE: &str = "package://github.com/example/fixture/releases/download/v1/schema@1";
+
+    #[test]
+    fn package_size_limits_apply_before_verification_or_parsing() {
+        assert!(
+            package_archive_with_fetch(PACKAGE, |_, limit| Some(vec![b' '; limit as usize + 1]))
+                .is_none()
+        );
+        let bytes = vec![0; MAX_MODULE_BYTES as usize + 1];
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "packageZipUrl":format!("https://{}.zip", PACKAGE.strip_prefix("package://").unwrap()),
+            "packageZipChecksums":{"sha256":format!("{:x}", Sha256::digest(&bytes))}
+        }))
+        .unwrap();
+        assert!(
+            package_archive_with_fetch(PACKAGE, |url, _| Some(if url.ends_with(".zip") {
+                bytes.clone()
+            } else {
+                metadata.clone()
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn decompressed_member_size_and_path_limits_remain_enforced() {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "Config.pkl",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        archive
+            .write_all(&vec![b' '; MAX_MODULE_BYTES as usize + 1])
+            .unwrap();
+        let archive = archive.finish().unwrap().into_inner();
+        assert!(package_member(&archive, "Config.pkl").is_none());
+        assert!(package_member(&archive, "../Config.pkl").is_none());
+    }
+
+    #[test]
+    fn unsupported_hosts_do_not_invoke_transport() {
+        assert!(
+            package_archive_with_fetch(
+                "package://localhost/releases/download/v1/schema@1",
+                |_, _| panic!("trust policy broadened")
+            )
+            .is_none()
+        );
+        let oversized = format!("{PACKAGE}{}", "x".repeat(8192));
+        assert!(
+            package_archive_with_fetch(&oversized, |_, _| panic!("URI limit bypassed")).is_none()
+        );
+        assert!(
+            package_archive_with_fetch(&format!("{PACKAGE}\n"), |_, _| panic!(
+                "control character accepted"
+            ))
+            .is_none()
+        );
+    }
 }
